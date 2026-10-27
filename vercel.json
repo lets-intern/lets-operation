@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/sync/mkt-planned-programs",
+      "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/cron/notice-reservations",
+      "schedule": "0 15 * * *"
+    }
+  ]
+}

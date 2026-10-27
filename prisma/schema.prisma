@@ -1,0 +1,877 @@
+// 테이블 구조는 이 파일 하나로 관리한다(plan.md §7).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// 챌린지 종류. 표기를 하나로 모으고 기수 자동 채움의 기준이 된다.
+model Challenge {
+  id   String @id @default(cuid())
+  name String @unique
+
+  /// 목록에 나오는 차례. 사람이 위·아래로 옮겨 정하고 설정·개설 화면이 같이 따른다(plan.md §5).
+  /// 값이 겹쳐도 이름순으로 갈리므로 순서가 흔들리지는 않는다.
+  position Int @default(0)
+
+  /// 실서비스 운영DB 의 challenge_type. 상세페이지가 실제로 열렸는지 대조할 때 쓴다.
+  /// 저쪽 제목은 표기가 계속 흔들려(`포트폴리오 2주 완성` ↔ `1주 완성`) 이름으로는 못 잇는다.
+  /// 여러 챌린지가 같은 값을 가질 수 있다 — 저쪽 구분 하나에 우리 챌린지가 여럿 들어간다.
+  /// 비어 있으면 그 챌린지의 기수는 자동 확인 대상에서 빠진다.
+  serviceType Int? @map("service_type")
+
+  /// 참여자 안내문이 예약될 슬랙 채널. 안내문과 같은 자리에 둔다 — 기수마다 채널을
+  /// 다시 적지 않기 위해서다(plan.md §5).
+  /// 비어 있으면 그 챌린지의 예약은 걸리지 않고 그 사실이 운영 화면에 사유로 남는다.
+  slackChannelId String? @map("slack_channel_id")
+
+  /// 이 챌린지의 안내문을 누구 계정으로 예약할지. 챌린지마다 보내는 사람이 다르다.
+  /// 비어 있으면 예약이 걸리지 않는다 — 채널과 같은 이유로 사유가 남는다.
+  slackSenderId String?      @map("slack_sender_id")
+  slackSender   SlackSender? @relation(fields: [slackSenderId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  programs Program[]
+  settings ChallengeSetting[]
+  aliases  ChallengeAlias[]
+  notices  ProgramNotice[]
+
+  @@map("challenge")
+}
+
+/// 마케팅팀이 쓰는 이름과 우리 이름을 잇는다. 표기를 저쪽에 맞추지 않고 우리 것을 지키기 위해서다.
+/// 이름이 애초에 같은 챌린지는 별칭이 필요 없다 — 대조는 우리 이름을 먼저 본다(plan.md §5).
+model ChallengeAlias {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  /// 버전 표기와 기수를 뗀 마케팅팀 이름. 한 이름이 두 챌린지를 가리킬 수는 없다.
+  name String @unique
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([challengeId])
+  @@map("challenge_alias")
+}
+
+/// 같은 챌린지가 대상에 따라 둘로 나뉘는 경우가 있다. 갈래는 이 둘로 고정이다(plan.md §5).
+/// 나뉘지 않는 챌린지는 COMMON 한 벌만 둔다.
+enum ProgramVersion {
+  COMMON
+  ENTRY
+  EXPERIENCED
+
+  @@map("program_version")
+}
+
+/// 한 챌린지의 운영 방식. 기수가 늘어도 다시 적지 않도록 챌린지 단위로 둔다(plan.md §5).
+model ChallengeSetting {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  /// 나뉘지 않는 챌린지는 COMMON 하나뿐이다. 나뉘면 ENTRY / EXPERIENCED 두 벌이 된다.
+  /// 같은 커리큘럼 안에서 COMMON 과 나머지가 섞이지 않도록 저장할 때 막는다.
+  version ProgramVersion @default(COMMON)
+
+  /// 커리큘럼(일수). 0 은 구분 없음, 7 은 `1주`, 14 는 `2주`, 나머지는 `9일` 처럼 일수 그대로다.
+  /// 버전과 달리 기수마다 하나를 골라 연다(program.curriculum_days). 이름표일 뿐 수행기간이 아니다.
+  /// 한 챌린지 안에서 0 과 나머지가 섞이지 않도록 저장할 때 막는다. 커리큘럼 목록은 따로 두지
+  /// 않는다 — 설정을 적어둔 커리큘럼이 곧 그 챌린지의 커리큘럼이다(plan.md §5).
+  curriculumDays Int @default(0) @map("curriculum_days")
+
+  /// 미션이 도는 기간(일). 피드백 기간은 여기 포함되지 않는다.
+  /// 피드백 횟수는 두지 않는다. 미션에 적어둔 피드백을 세면 나오는 값이다(plan.md §5).
+  durationDays Int @map("duration_days")
+
+  missions ChallengeMission[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([challengeId, curriculumDays, version])
+  @@map("challenge_setting")
+}
+
+/// 피드백은 서면과 라이브 두 가지로 제공된다. 갈래는 이 둘로 고정이다(plan.md §5).
+enum FeedbackKind {
+  WRITTEN
+  LIVE
+
+  @@map("feedback_kind")
+}
+
+/// 미션 하나의 수행 기간. 미션 개수는 이 줄 수가 곧 답이라 따로 저장하지 않는다.
+model ChallengeMission {
+  id        String           @id @default(cuid())
+  settingId String           @map("setting_id")
+  setting   ChallengeSetting @relation(fields: [settingId], references: [id], onDelete: Cascade)
+
+  /// 1부터. 화면의 "미션 3" 의 3 이자 정렬 기준이다.
+  seq Int
+
+  /// 이 미션의 수행 기간(일)
+  durationDays Int @map("duration_days")
+
+  /// 이 미션이 끝난 뒤 붙는 피드백의 종류. 피드백이 없는 미션은 비어 있다.
+  /// 한 미션 뒤에 서면과 라이브가 함께 도는 구성은 없어 한 줄에 하나만 둔다.
+  feedbackKind FeedbackKind? @map("feedback_kind")
+
+  /// 피드백이 도는 일수(보통 1~4일). 종류가 있으면 함께 있다.
+  feedbackDays Int? @map("feedback_days")
+
+  @@unique([settingId, seq])
+  @@map("challenge_mission")
+}
+
+/// 안내문을 예약할 슬랙 계정. **봇이 아니라 사람의 계정**이다(plan.md §5) — 예약이 그
+/// 사람의 슬랙 `예약된 메시지` 목록에 서서 거기서 고치고 지울 수 있기 때문이다.
+///
+/// 챌린지마다 보내는 사람이 다르므로 계정을 여러 벌 두고 챌린지가 하나를 가리킨다.
+model SlackSender {
+  id String @id @default(cuid())
+
+  /// 화면에 서는 이름. 누구 계정으로 나갈지 사람이 가리는 표시다.
+  name String @unique
+
+  /// 슬랙 사용자 토큰(`xoxp-`). **화면으로 돌려주지 않는다** — 적을 수만 있고 읽을 수는
+  /// 없다. 이 앱은 팀 공용 비밀번호 하나로 열리고 계정 분리가 없어서(plan.md §2), 읽어
+  /// 보낼 수 있는 자리를 만들면 남의 슬랙 자격이 그 자리에 놓인다.
+  /// 화면이 쓰는 것은 앞뒤 몇 자를 남긴 표시뿐이다(domain/slack-sender).
+  token String
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  /// 이 계정으로 보내는 챌린지들. 계정을 지우면 그 챌린지의 선택이 비고 예약이 멈춘다.
+  challenges Challenge[]
+
+  @@map("slack_sender")
+}
+
+/// 안내문을 받는 쪽. 받는 쪽이 곧 나가는 통로를 정한다 — 참여자는 챌린지 슬랙 채널,
+/// 챌린지 공지방은 모든 챌린지가 함께 쓰는 전체 공지 채널, 멘토는 카카오톡이다.
+/// 그래서 통로를 따로 저장하지 않는다. 한쪽을 다른 통로로 옮기는 날이 오면 그때 칸을 더한다.
+enum NoticeAudience {
+  PARTICIPANT
+  MENTOR
+  ANNOUNCEMENT
+
+  @@map("notice_audience")
+}
+
+/// 챌린지에 딸리지 않는 안내문 설정. 줄은 하나뿐이다(`id = "default"`).
+///
+/// 챌린지 공지방 채널이 여기 있는 것은 **모든 챌린지가 같은 채널 하나를 쓰기** 때문이다.
+/// 챌린지마다 적게 두면 한 곳만 바뀌었을 때 어느 챌린지 공지가 옛 채널로 가는지 모른다(plan.md §5).
+model NoticeSetting {
+  id String @id @default("default")
+
+  /// 챌린지 공지방 안내문이 예약될 전체 공지 채널. 비어 있으면 공지방 글만 걸리지 않고
+  /// 사유가 남는다 — 같은 기수의 참여자 글은 그대로 걸린다.
+  announcementChannelId String? @map("announcement_channel_id")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("notice_setting")
+}
+
+/// 회차 밖 안내문이 서는 자리. 개강을 알리는 글과 수료를 알리는 글은 기준일도(시작일 ·
+/// 종료일) 방향도(앞 · 뒤) 반대라 한 자리에 섞지 않는다.
+enum NoticePhase {
+  BEFORE_START
+  AFTER_END
+
+  @@map("notice_phase")
+}
+
+/// 예약 발송 시각을 재는 기준일. 안내문은 챌린지에 붙어 기수의 날짜를 모르므로,
+/// 날짜 대신 "무엇으로부터 며칠"을 적어둔다. 기수가 서면 그 기수의 날짜로 계산된다.
+enum NoticeAnchor {
+  MISSION_START
+  MISSION_END
+  PROGRAM_START
+  PROGRAM_END
+
+  @@map("notice_anchor")
+}
+
+/// 한 회차에 나가는 안내문 한 장. 설정과 같은 이유로 기수가 아니라 챌린지에 붙는다 —
+/// 30기든 31기든 미션 3의 안내문은 같은 내용이라 기수마다 다시 적지 않는다(plan.md §5).
+model ProgramNotice {
+  id String @id @default(cuid())
+
+  /// 어느 챌린지의 안내문인지. **챌린지 공지방 글만 비어 있다** — 모든 챌린지가 한 벌을
+  /// 함께 쓰기 때문이다(plan.md §5). 지키는 주체는 CHECK 제약(`program_notice_announcement_check`)이다.
+  challengeId String?    @map("challenge_id")
+  challenge   Challenge? @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  audience NoticeAudience
+
+  /// 몇 번째 미션의 안내문인지. 회차 밖 안내문이면 비어 있고, 대신 `phase` 가 찬다.
+  /// `challenge_mission` 을 가리키지 않는다. 미션 줄은 버전별 설정 아래 있는데 안내문은
+  /// 버전을 가리지 않아(같은 회차면 두 갈래에 같은 내용이 나간다), 외래키로 이으면
+  /// 버전마다 같은 안내문을 두 번 적게 된다. 그래서 회차 번호로만 잇는다.
+  /// 설정에서 미션 개수를 줄여 갈 곳이 없어진 회차도 남는다 — 적어둔 글을 조용히 지우지 않고
+  /// 화면에서 눈에 띄게 두어 사람이 정한다.
+  missionSeq Int? @map("mission_seq")
+
+  /// 회차 밖 안내문의 자리(시작 전 · 종료 후). 회차에 붙은 안내문이면 비어 있다.
+  /// `mission_seq` 와 정확히 하나만 찬다 — 지키는 주체는 화면이 아니라 테이블의
+  /// CHECK 제약(`program_notice_placement_check`)이다.
+  phase NoticePhase?
+
+  /// 목록에서 이 안내문을 가리키는 이름. 보내는 내용이 아니라 고르기 위한 표시다.
+  title String
+
+  /// 실제로 나가는 글.
+  body String
+
+  /// 예약 발송 시점. 참여자 안내문만 갖는다 — 멘토 안내문은 카카오톡으로 그때그때 보내
+  /// 예약이 필요 없다. 세 칸은 함께 있거나 함께 비어 있다. 비어 있으면 사람이 직접 보낸다.
+  scheduleAnchor NoticeAnchor? @map("schedule_anchor")
+
+  /// 기준일로부터 며칠. 음수면 기준일 전, 0 이면 당일, 양수면 뒤다.
+  scheduleOffsetDays Int? @map("schedule_offset_days")
+
+  /// 그날 몇 시에 나가는지. 자정부터 흐른 분이라 오전 10시는 600 이다.
+  /// 시·분을 따로 두지 않는 것은 두 칸이 어긋난 시각이 저장될 자리를 없애기 위해서다.
+  scheduleMinuteOfDay Int? @map("schedule_minute_of_day")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  /// 이 글이 기수마다 슬랙에 걸린 예약. 글을 지우면 예약 기록도 함께 사라진다 —
+  /// 슬랙에 이미 걸린 것은 슬랙에 남지만, 우리가 무엇을 걸었다는 기록은 글에 딸린 것이다.
+  reservations NoticeReservation[]
+
+  /// 같은 자리에 여러 장이 설 수 있다 — 미션 시작 안내와 마감 하루 전 리마인드가 그렇다.
+  /// 차례는 적은 순서이고, 그래서 유일 제약을 두지 않는다.
+  @@index([challengeId, audience, missionSeq])
+  @@map("program_notice")
+}
+
+/// 한 기수의 안내문 한 장을 슬랙에 걸어 본 결과. 걸린 것과 못 걸린 것이 같은 테이블에
+/// 있는 이유는, 못 걸린 것도 사람이 봐야 할 결과이고 사유가 풀리면 같은 자리에서 다시
+/// 시도되기 때문이다(plan.md §5).
+///
+/// 줄이 있다는 것 자체가 "이 기수의 이 글은 이미 다뤘다" 는 표시다. 크론은 하루 한 번
+/// 돌면서 같은 기수를 며칠에 걸쳐 다시 보게 되는데, 성공한 줄을 건너뛰는 근거가 이 줄이다.
+model NoticeReservation {
+  id String @id @default(cuid())
+
+  programId String  @map("program_id")
+  program   Program @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  noticeId String        @map("notice_id")
+  notice   ProgramNotice @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+
+  /// 실제로 나갈 시각. 슬랙에 넘긴 값 그대로다. 못 걸었으면 비어 있다 —
+  /// 계산조차 못 한 경우(종료일을 모르는 기수)가 있기 때문이다.
+  postAt DateTime? @map("post_at")
+
+  /// 걸던 시점의 채널. 챌린지의 채널이 나중에 바뀌어도 어디로 걸었는지는 남아야 한다.
+  channelId String? @map("channel_id")
+
+  /// 걸던 시점의 보내는 사람 이름. 예약이 **그 사람의 슬랙 예약 목록**에 서 있으므로,
+  /// 고치거나 지울 사람이 누구인지가 화면에서 읽혀야 한다. 계정을 지워도 남아야 해서
+  /// 외래키가 아니라 이름을 그대로 박아 둔다.
+  senderName String? @map("sender_name")
+
+  /// 슬랙이 돌려준 예약 식별자. 이 값이 있으면 걸린 것이고, 다시 걸지 않는다.
+  /// 사람이 슬랙에서 지울 때 찾는 열쇠이기도 하다.
+  slackMessageId String? @map("slack_message_id")
+
+  /// 못 걸린 사유. 걸렸으면 비어 있다. 사유가 풀리면 다음 크론이 이 줄을 다시 시도한다.
+  failure String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  /// 한 기수의 한 글은 한 번만 걸린다. 크론이 며칠에 걸쳐 같은 기수를 봐도 두 통이
+  /// 나가지 않는 것을 화면이 아니라 이 제약이 지킨다.
+  @@unique([programId, noticeId])
+  @@index([postAt])
+  @@map("notice_reservation")
+}
+
+/// 한 기수의 프로그램. 개설이 곧 이 레코드의 생성 1단계다.
+model Program {
+  id          String    @id @default(cuid())
+  challengeId String    @map("challenge_id")
+  /// 기수가 남아 있는 챌린지는 지울 수 없다. 이름을 지우는 김에 프로그램과 태스크가
+  /// 딸려 사라지는 일을 막는다.
+  challenge   Challenge @relation(fields: [challengeId], references: [id], onDelete: Restrict)
+
+  /// "포트폴리오 챌린지 30기"의 30
+  cohort Int
+
+  /// 이 기수가 여는 커리큘럼(일수, challenge_setting.curriculum_days). 마케팅팀 제목에도 실서비스
+  /// 제목에도 믿을 만한 표기가 없어 개설 목록에서 사람이 고른다(plan.md §5).
+  /// 비어 있으면 미지정이다 — 커리큘럼이 나뉘는 챌린지의 미지정 기수는 어림하지 않고 미션을
+  /// 그리지도, 회차 안내문을 걸지도 않는다. 가져오기 · 되짚기로 선 기수는 비어서 선다.
+  curriculumDays Int? @map("curriculum_days")
+
+  startDate DateTime @map("start_date") @db.Date
+
+  /// 운영 종료일. 실서비스에서 되짚어 온 기수는 저쪽이 적어둔 날이 그대로 들어온다.
+  /// 개설로 세운 기수는 비어 있고, 그때는 마케팅 기획의 종료일을 본다(plan.md §9 — 보류).
+  endDate DateTime? @map("end_date") @db.Date
+
+  /// 상세페이지 오픈 목표일. 기본값은 시작일 2주 전(직전 평일).
+  /// 실서비스에서 되짚어 온 기수는 목표일이 아니라 **실제로 열린 날**이 들어온다.
+  detailOpenTargetDate DateTime @map("detail_open_target_date") @db.Date
+
+  /// 실서비스 목록에서 되짚어 세운 기수라는 표시이자 그 시각. 개설로 세운 기수는 비어 있다.
+  /// 이 값이 있는 기수는 개설 예정 목록에 오르지 않고 상세페이지 오픈 태스크도 갖지 않는다 —
+  /// 앞으로 열어야 할 페이지가 아니라 이미 열려 돌았던 기록이기 때문이다.
+  serviceImportedAt DateTime? @map("service_imported_at")
+
+  /// 개설 시점에는 비어 있고 프로그램 운영에서 채운다.
+  redashDashboardUrl String? @map("redash_dashboard_url")
+
+  clonedFromId String?   @map("cloned_from_id")
+  clonedFrom   Program?  @relation("ProgramClone", fields: [clonedFromId], references: [id])
+  clones       Program[] @relation("ProgramClone")
+
+  /// 이 기수를 세운 마케팅팀 기획. 버전이 나뉘는 챌린지는 두 줄이 한 기수를 가리키므로
+  /// 연결은 기획 쪽에 둔다. 손으로 만든 기수는 비어 있다.
+  mktPlans MktPlannedProgram[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tasks Task[]
+
+  /// 이 기수 앞으로 슬랙에 걸어둔 안내문 예약. 기수를 지우면 함께 사라진다.
+  noticeReservations NoticeReservation[]
+
+  @@unique([challengeId, cohort])
+  @@map("program")
+}
+
+/// 마일스톤도 결국 날짜가 있는 할 일이라 태스크와 한 테이블에 둔다(plan.md §7).
+enum TaskKind {
+  MILESTONE
+  TASK
+
+  @@map("task_kind")
+}
+
+enum TaskStatus {
+  TODO
+  DOING
+  DONE
+
+  @@map("task_status")
+}
+
+model Task {
+  id        String  @id @default(cuid())
+  programId String  @map("program_id")
+  program   Program @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  title   String
+  kind    TaskKind   @default(TASK)
+  status  TaskStatus @default(TODO)
+  dueDate DateTime   @map("due_date") @db.Date
+
+  /// 실서비스에서 상세페이지가 열린 것으로 확인된 시각. 확인과 완료를 나눠 두면
+  /// 판정이 맞는지 지켜보는 동안 상태를 건드리지 않을 수 있다.
+  detailOpenSeenAt DateTime? @map("detail_open_seen_at")
+
+  /// 그 판단의 근거가 된 운영DB 의 challenge_id. 어느 행을 보고 정했는지 되짚을 수 있어야 한다.
+  detailOpenRef String? @map("detail_open_ref")
+
+  /// 확인을 근거로 우리가 완료로 올린 시각. 사람이 올린 완료와 구분하려는 것이다.
+  /// 값이 있으면 자동 판정이 이미 끝난 태스크라 다시 건드리지 않는다.
+  autoDoneAt DateTime? @map("auto_done_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([dueDate])
+  @@map("task")
+}
+
+/// 실서비스 챌린지 상세페이지 사본. 공개 API 에서 받아온다(plan.md §5 — 상세페이지).
+/// 페이지의 주인은 마케팅팀이라 우리는 읽기만 한다. 검색은 이 사본에서 해서, 찾을 때마다
+/// 저쪽 API 를 백몇십 번 부르지 않고 저쪽이 느리거나 막혀도 찾기는 된다.
+model ServiceDetailPage {
+  /// 실서비스 챌린지 id. 상세페이지 주소 `/program/challenge/{id}` 의 그 값이다.
+  id Int @id
+
+  title String
+
+  /// 저쪽 모집 상태 그대로. PROCEEDING(진행 중) · POST(지난) 등.
+  status String
+
+  startDate DateTime? @map("start_date") @db.Date
+  endDate   DateTime? @map("end_date") @db.Date
+
+  /// 우리 말로 옮긴 상세 내용(DetailPageContent). 아직 한 번도 받지 못했으면 비어 있다.
+  content Json?
+
+  /// 마지막 상세 받아오기가 실패한 사유. 실패해도 예전 내용은 지우지 않고 남긴다.
+  fetchError String? @map("fetch_error")
+
+  /// 상세 내용을 마지막으로 받아온 시각. 화면에 "언제 받은 사본인지" 로 적힌다.
+  fetchedAt DateTime? @map("fetched_at")
+
+  /// 목록에서 마지막으로 본 시각. 목록만 새로 받고 상세는 아직일 수 있어 따로 둔다.
+  listedAt DateTime @map("listed_at")
+
+  /// 실서비스 페이지를 직접 띄워 읽은 글 · 이미지(ScreenItem[]) 차례 그대로. API 에 없는
+  /// 화면 고정 문구를 채우는 데 쓴다. 한 번도 못 읽었으면 비어 있다.
+  screen Json?
+
+  /// 화면을 읽은 기준 — 받아온 내용과 실서비스 배포 번호. 둘 다 같으면 다시 읽지 않는다.
+  screenKey String? @map("screen_key")
+
+  /// 마지막 화면 읽기가 실패한 사유. 실패해도 예전에 읽은 화면은 지우지 않는다.
+  screenError String? @map("screen_error")
+
+  /// 화면 읽기를 마지막으로 시도한 시각. 한 번 도는 동안 실패한 페이지를 다시 붙잡지 않는 데 쓴다.
+  screenedAt DateTime? @map("screened_at")
+
+  @@index([startDate])
+  @@map("service_detail_page")
+}
+
+/// 상세페이지 이미지에서 OCR 로 읽어낸 글. 기수가 바뀌어도 같은 이미지를 그대로 쓰는 일이
+/// 많아 이미지 주소를 열쇠로 둔다 — 새 이미지만 읽게 된다.
+model DetailImageText {
+  src String @id
+
+  /// 읽어낸 글 전체. 무료 OCR 이라 디자인 글꼴은 틀릴 수 있다.
+  text String
+
+  readAt DateTime @default(now()) @map("read_at")
+
+  @@map("detail_image_text")
+}
+
+/// 실서비스 미션 콘텐츠 사본(plan.md §5 — 미션 콘텐츠). 목록은 Redash 쿼리 335 에서,
+/// 본문은 Notion(oopy · 게시 페이지)에서 받는다. 콘텐츠의 주인은 실서비스라 우리는 읽기만 한다.
+model ServiceMissionContent {
+  /// 실서비스 contents_id. 미션 템플릿은 mission_template_id 를 음수로 둔다(번호가 겹치므로).
+  id Int @id
+
+  title String
+  link  String
+
+  /// 본문을 어디서 받는지. oopy · notion · other(받지 않고 링크만 둔다)
+  source String
+
+  /// Notion 블록을 우리 말로 옮긴 본문(NotionDoc). 받지 않는 링크이거나 아직 받지 못했으면 비어 있다.
+  content Json?
+
+  /// 마지막 본문 받아오기가 실패한 사유. 실패해도 예전 본문은 지우지 않고 남긴다.
+  fetchError String? @map("fetch_error")
+
+  /// 본문을 마지막으로 받아온 시각. 화면에 "언제 받은 사본인지" 로 적힌다.
+  fetchedAt DateTime? @map("fetched_at")
+
+  /// 쿼리 결과에서 마지막으로 본 시각. 결과에서 사라진 콘텐츠를 지우지 않고 표시하는 근거다.
+  listedAt DateTime @map("listed_at")
+
+  @@map("service_mission_content")
+}
+
+/// 미션에 콘텐츠가 붙은 연결 한 건. 불러올 때마다 쿼리 결과로 통째로 바꾼다.
+model ServiceMissionContentUse {
+  missionId Int @map("mission_id")
+  contentId Int @map("content_id")
+
+  /// TEMPLATE(미션 템플릿) · ESSENTIAL(필수) · ADDITIONAL(추가) · LIMITED(제한) · UNKNOWN
+  kind String
+
+  challengeId        Int       @map("challenge_id")
+  challengeTitle     String    @map("challenge_title")
+  challengeStartDate DateTime? @map("challenge_start_date") @db.Date
+  challengeEndDate   DateTime? @map("challenge_end_date") @db.Date
+
+  missionTh      Int       @map("mission_th")
+  missionTitle   String    @map("mission_title")
+  missionEndDate DateTime? @map("mission_end_date") @db.Date
+
+  /// Redash 에서 쿼리가 실제로 돈 시각. 화면에 "언제 기준 연결인지" 로 적힌다.
+  queryRetrievedAt DateTime @map("query_retrieved_at")
+
+  @@id([missionId, contentId])
+  @@index([challengeId])
+  @@index([contentId])
+  @@map("service_mission_content_use")
+}
+
+/// 마케팅팀 사이트의 `mkt_planned_programs` 를 주기적으로 복사해 온 사본.
+/// 원본의 주인은 저쪽이라 우리 화면에서는 읽기만 하고 고치지 않는다.
+/// 우리 `program` 과 합치지 않는 이유는 개설 여부가 아직 정해지지 않은 후보이고,
+/// 저쪽 스키마가 바뀌어도 우리 테이블이 흔들리지 않아야 하기 때문이다.
+model MktPlannedProgram {
+  id String @id @default(cuid())
+
+  /// 원본 테이블의 uuid. 다시 가져올 때 같은 줄끼리 짝을 맞추는 열쇠다.
+  sourceId String @unique @map("source_id")
+
+  category String
+  title    String
+  owner    String
+  note     String
+
+  startDate DateTime? @map("start_date") @db.Date
+  endDate   DateTime? @map("end_date") @db.Date
+
+  /// 저쪽이 잡아둔 오픈 마감일. 우리 `program.detail_open_target_date` 와는 다른 값이다.
+  openDeadline DateTime? @map("open_deadline") @db.Date
+
+  opened Boolean
+
+  /// 저쪽 목록의 차례. 우리도 같은 순서로 보여 두 화면이 어긋나지 않게 한다.
+  sortOrder Int @map("sort_order")
+
+  /// 원본에서 만들어진 시각. 우리가 가져온 시각은 syncedAt 이다.
+  sourceCreatedAt DateTime @map("source_created_at")
+
+  /// 마지막으로 복사해 온 시각. 동기화마다 모든 줄이 새로 찍혀 최댓값이 곧 마지막 동기화다.
+  syncedAt DateTime @updatedAt @map("synced_at")
+
+  /// 제목 앞 "[대학생·무경력 Ver.]" 에서 읽어낸 갈래. 접두어가 없으면 COMMON 이다.
+  /// 기수는 버전을 갖지 않으므로(plan.md §5) 이 값은 기수가 아니라 기획 줄에 붙는다.
+  /// 버전마다 상세페이지가 따로 열리므로 오픈 태스크는 이 값만큼 생긴다.
+  version ProgramVersion @default(COMMON)
+
+  /// 이 기획으로 세운 기수. 비어 있으면 아직 개설되지 않았다는 뜻이다.
+  /// 버전이 나뉘는 챌린지는 두 줄이 같은 기수를 가리킨다(plan.md §5 — 기수는 버전을 갖지 않는다).
+  /// 기수를 지우면 비워지고, 저쪽 목록에 남아 있는 한 다음 가져오기에 다시 선다.
+  programId String?  @map("program_id")
+  program   Program? @relation(fields: [programId], references: [id], onDelete: SetNull)
+
+  @@index([sortOrder])
+  @@index([programId])
+  @@map("mkt_planned_program")
+}
+
+/// 실서비스 챌린지 사본(plan.md §5 — 미션 가이드). 가이드 · 공지 · 미션을 거는 축이다.
+/// 미션 콘텐츠 화면은 연결 줄마다 챌린지 이름을 들고 있었지만, 이 화면은 챌린지가 축이라 따로 세운다.
+model ServiceGuideChallenge {
+  /// 실서비스 challenge_id
+  id Int @id
+
+  title     String
+  startDate DateTime? @map("start_date") @db.Date
+  endDate   DateTime? @map("end_date") @db.Date
+
+  /// Redash 에서 쿼리가 실제로 돈 시각. 화면에 "언제 기준인지" 로 적힌다.
+  queryRetrievedAt DateTime @map("query_retrieved_at")
+
+  @@index([startDate])
+  @@map("service_guide_challenge")
+}
+
+/// 챌린지에 걸린 자료 한 건. 불러올 때마다 쿼리 336 결과로 통째로 바꾼다.
+/// 자료id 는 종류마다 따로 세는 번호(challenge_guide_id · challenge_notice_id · mission_id)라
+/// 종류와 짝을 지어야 열쇠가 된다.
+model ServiceGuideItem {
+  /// GUIDE(챌린지 가이드) · NOTICE(대시보드 공지사항) · MISSION(미션)
+  kind     String
+  sourceId Int    @map("source_id")
+
+  challengeId Int @map("challenge_id")
+
+  /// 가이드 · 공지의 제목, 미션은 그 기수에 적힌 미션명(mission.title).
+  title String
+
+  /// 가이드 · 공지가 가리키는 원문 주소. 미션은 비어 있다 — 미션 문구는 DB 안의 글이다.
+  link String?
+
+  /// 미션일 때 딸린 미션 템플릿. 여러 기수가 같은 템플릿을 쓰므로 문구는 템플릿 쪽에 한 벌만 둔다.
+  templateId Int? @map("template_id")
+
+  /// 미션 회차와 마감일
+  th      Int?
+  endDate DateTime? @map("end_date") @db.Date
+
+  /// 저쪽에서 마지막으로 고친 시각. 같은 문구가 언제 손댄 것인지 가늠하는 근거다.
+  modifiedAt DateTime? @map("modified_at")
+
+  @@id([kind, sourceId])
+  @@index([challengeId])
+  @@index([templateId])
+  @@map("service_guide_item")
+}
+
+/// 실서비스 미션 템플릿 사본. 미션명 · 내용 · 가이드 내용이 여기 있다(mission_template).
+/// 미션 2,040줄이 템플릿 166개를 돌려 쓰므로 문구는 여기 한 벌만 둔다.
+model ServiceMissionTemplate {
+  /// 실서비스 mission_template_id
+  id Int @id
+
+  title       String
+  description String
+  guide       String
+
+  /// 쿼리 결과에서 마지막으로 본 시각. 결과에서 사라진 템플릿을 지우지 않고 표시하는 근거다.
+  listedAt DateTime @map("listed_at")
+
+  @@map("service_mission_template")
+}
+
+/// 가이드 · 공지가 가리키는 Notion 원문 사본. 기수마다 같은 주소를 돌려 쓰므로(가이드 749줄에
+/// 고유 주소 37개) 주소를 열쇠로 둔다 — 같은 원문을 여러 번 받지 않게 된다.
+model ServiceGuideDoc {
+  link String @id
+
+  /// 본문을 어디서 받는지. oopy · notion · other(받지 않고 링크만 둔다)
+  source String
+
+  /// Notion 블록을 우리 말로 옮긴 본문(NotionDoc). 받지 않는 링크이거나 아직 받지 못했으면 비어 있다.
+  content Json?
+
+  /// 마지막 받아오기가 실패한 사유. 실패해도 예전 본문은 지우지 않고 남긴다.
+  fetchError String? @map("fetch_error")
+
+  /// 본문을 마지막으로 받아온 시각. 비어 있으면 아직 한 번도 받지 못한 것이라 다음 불러오기가 먼저 집는다.
+  fetchedAt DateTime? @map("fetched_at")
+
+  /// 쿼리 결과에서 마지막으로 본 시각
+  listedAt DateTime @map("listed_at")
+
+  @@index([fetchedAt])
+  @@map("service_guide_doc")
+}
+
+/// 실서비스 챌린지 1:1 문의 사본(plan.md §5 — CS 수집). 불러올 때마다 쿼리 337 결과로 통째로 바꾼다.
+/// 테스트 문의는 받아올 때 뺀다. 매니저가 고친 카테고리는 여기 두지 않는다 — 통째로 바꾸면 지워진다.
+model ServiceCsInquiry {
+  /// 실서비스 challenge_question_id
+  id Int @id
+
+  /// 문의를 남긴 시각
+  createdAt  DateTime  @map("created_at")
+  /// 저쪽에서 마지막으로 고친 시각. 답변을 달거나 고쳐도 바뀐다.
+  modifiedAt DateTime? @map("modified_at")
+
+  challengeId    Int     @map("challenge_id")
+  challengeTitle String  @map("challenge_title")
+  userId         Int     @map("user_id")
+  customerName   String  @map("customer_name")
+  /// 베이직 · 스탠다드 · 프리미엄 · 라이트. 신청에서 붙여 오므로 신청이 없으면 비어 있다.
+  plan           String?
+
+  title     String
+  body      String
+  imageUrls String[] @map("image_urls")
+
+  /// 답변을 줄글로 옮긴 것. 비어 있으면(null) 아직 답하지 않은 문의다 — 저쪽에 답변 상태 칸이 따로 없다.
+  answer          String?
+  answerImageUrls String[]  @map("answer_image_urls")
+  /// 고객이 답변을 읽은 시각
+  answerReadAt    DateTime? @map("answer_read_at")
+
+  /// Redash 에서 쿼리가 실제로 돈 시각
+  queryRetrievedAt DateTime @map("query_retrieved_at")
+
+  @@index([createdAt])
+  @@map("service_cs_inquiry")
+}
+
+/// 매니저가 고친 문의 카테고리. 없으면 키워드 규칙이 붙인 것을 쓴다(domain/cs-inquiry.ts).
+/// 사본과 따로 두어 불러오기가 사본을 통째로 바꿔도 남는다.
+model CsInquiryCategory {
+  /// 실서비스 challenge_question_id
+  inquiryId  Int      @id @map("inquiry_id")
+  categories String[]
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("cs_inquiry_category")
+}
+
+/// 매니저가 목록에서 숨긴 문의. 사본과 따로 두어 불러오기가 사본을 통째로 바꿔도 남는다.
+model CsInquiryHidden {
+  /// 실서비스 challenge_question_id
+  inquiryId Int      @id @map("inquiry_id")
+  hiddenAt  DateTime @default(now()) @map("hidden_at")
+
+  @@map("cs_inquiry_hidden")
+}
+
+/// 실서비스 챌린지 한 기수의 미션 제출 사본(plan.md §5 — 참여자 수행 현황). 불러올 때마다 쿼리 344 결과로 통째로 바꾼다.
+/// 쿼리는 신청 × 미션 한 줄씩 4만 줄을 내보내므로 기수 하나에 한 줄로 접어 둔다. 숫자는 저쪽 값 그대로 두고
+/// 정시 · 지각 · 반려와 점수 · 경고는 화면을 그릴 때마다 계산한다 — 규칙을 고치면 불러오기 없이 반영된다.
+/// 테스트 챌린지 · 테스트 계정은 받아올 때 뺀다.
+model ServiceProgressCohort {
+  /// 실서비스 challenge_id
+  id Int @id
+
+  /// 실서비스 challenge_type. 같은 챌린지의 지난 기수를 묶는 기준이다.
+  type      Int
+  title     String
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+
+  /// 미션 목록 — [{ missionId, th, kind, due, score, lateScore }]. due 는 한국 시각 `YYYY-MM-DD HH:MM:SS`.
+  missions     Json
+  /// 참여자 — [{ userId, codes }]. codes 는 missions 와 같은 순서로 제출상태값 · 확인결과값을 이은 두 글자, 제출이 없으면 "".
+  participants Json
+
+  /// Redash 에서 쿼리가 실제로 돈 시각
+  queryRetrievedAt DateTime @map("query_retrieved_at")
+
+  @@index([startDate])
+  @@map("service_progress_cohort")
+}
+
+/// 실서비스 후기 사본(plan.md §5 — 후기 관리). 후기 글 한 칸이 한 줄이다 — 챌린지 · 라이브 후기는 목표 · 좋았던 점 …
+/// 칸마다 줄이 나뉜다. 불러올 때마다 쿼리 349(미션 외 다섯 유형) · 350(미션) 결과로 유형별로 통째로 바꾼다.
+/// 테스트 후기는 받아올 때 뺀다. 매니저가 고친 카테고리는 여기 두지 않는다 — 통째로 바꾸면 지워진다.
+model ServiceReview {
+  /// `유형:후기id:칸id` — 칸이 없는 유형은 칸id 자리가 0 이다
+  key      String @id
+  /// domain/review.ts 의 REVIEW_TYPES 키
+  type     String
+  /// 저쪽 후기 번호. 유형마다 다른 표의 번호다(review · attendance · feedback · blog_review).
+  reviewId Int    @map("review_id")
+  /// review_item 번호. 칸이 하나뿐인 유형은 비어 있다.
+  itemId   Int?   @map("item_id")
+  /// 목표 · 좋았던 점 · 미션 소감 …
+  part     String
+
+  /// 쓴 시각. 라이브 멘토링은 멘토링 일시, 블로그는 글 게시일이다.
+  writtenAt    DateTime @map("written_at")
+  programId    Int?     @map("program_id")
+  programTitle String   @map("program_title")
+  /// 미션 · 라이브 멘토링 회차
+  th           Int?
+  missionTitle String?  @map("mission_title")
+  /// 2025-01 이전 후기는 신청과 이어지지 않아 비어 있다.
+  authorName   String?  @map("author_name")
+  userId       Int?     @map("user_id")
+  mentorName   String?  @map("mentor_name")
+  score        Int?
+  nps          Int?
+  content      String
+  /// 후기 노출 여부(실서비스)
+  visible      Boolean
+  /// 칸 노출 여부. 칸이 따로 있는 챌린지 · 라이브만 있다.
+  partVisible  Boolean? @map("part_visible")
+  /// 블로그 글 주소 · 제목
+  url          String?
+  blogTitle    String?  @map("blog_title")
+
+  /// Redash 에서 쿼리가 실제로 돈 시각
+  queryRetrievedAt DateTime @map("query_retrieved_at")
+
+  @@index([type, writtenAt])
+  @@map("service_review")
+}
+
+/// 매니저가 고친 후기 칸 카테고리. 없으면 키워드 규칙이 붙인 것을 쓴다(domain/review.ts).
+/// 사본과 따로 두어 불러오기가 사본을 통째로 바꿔도 남는다.
+model ReviewCategory {
+  /// ServiceReview.key
+  key        String   @id
+  categories String[]
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("review_category")
+}
+
+/// 업무 수행 화면이 읽고 쓰는 구글 캘린더 연결(plan.md §5 — 업무 수행). 줄은 하나뿐이다(`id = "default"`).
+///
+/// **계정 하나만 잇는다.** 이 앱은 팀 공용 비밀번호 하나로 열리고 계정 분리가 없어서(plan.md §2),
+/// 사람마다 따로 잇는 길을 열어도 누가 누구인지 가릴 수 없다. 연결한 사람의 일정이 팀원 화면에도
+/// 그대로 보이는 것은 감수하기로 했다.
+///
+/// 연결한 Gmail 이 '테스트' 상태의 OAuth 앱에 붙어 있어 갱신 토큰이 7일마다 만료된다. 만료되면
+/// 줄을 지우지 않고 끊긴 시각과 사유를 적어 둔다 — 화면이 "왜 끊겼는지" 와 다시 연결 버튼을 보여 준다.
+model GoogleCalendarConnection {
+  id String @id @default("default")
+
+  /// 연결한 구글 계정. 화면에 서는 표시이고, 누구 일정을 보고 있는지 가리는 근거다.
+  email String
+
+  /// 갱신 토큰과 접근 토큰. **화면으로 돌려주지 않는다** — 읽어 보낼 수 있는 자리를 만들면
+  /// 연결한 사람의 구글 자격이 비밀번호 하나 아는 모든 사람 앞에 놓인다(domain/google-calendar).
+  refreshToken         String    @map("refresh_token")
+  accessToken          String?   @map("access_token")
+  accessTokenExpiresAt DateTime? @map("access_token_expires_at")
+
+  /// 구글이 갱신 토큰을 거절한 시각과 사람이 읽을 사유. 다시 연결하면 비워진다.
+  disconnectedAt   DateTime? @map("disconnected_at")
+  disconnectReason String?   @map("disconnect_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("google_calendar_connection")
+}
+
+/// 돌고 있는 업무 타이머(plan.md §5 — 업무 수행). 한 번에 하나만 돌아서 줄도 하나뿐이다(`id = "running"`).
+///
+/// 시작 시각을 DB 에 두는 것은 **탭을 닫거나 기기를 바꿔도 계속 흐르게** 하기 위해서다. 경과 시간은
+/// 저장하지 않고 화면이 시작 시각에서 그때그때 센다. 끝내면 시작~종료가 구글 캘린더 일정이 되고 줄은 지워진다.
+model WorkTimer {
+  id String @id @default("running")
+
+  /// 시작할 때 적은 제목. 비워 두고 시작해도 된다 — 끝낼 때 적는다.
+  title     String?
+  startedAt DateTime @map("started_at")
+
+  /// `종료` 를 누른 서버 시각. 차 있으면 확인 폼을 적는 중이고, 등록하면 이 시각이 일정의 끝이 된다.
+  /// 기기 시계를 믿지 않으려고 서버가 굳힌다. 다시 열어도 확인 폼 상태가 이어지고, `계속하기` 를 누르면 비워진다.
+  endingAt DateTime? @map("ending_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("work_timer")
+}
+
+/// 멘토 모집 랜딩(lets-mentor 저장소)이 받는 멘토 신청서(plan.md §5 — 멘토 관리). 같은 Supabase 프로젝트에 있다.
+///
+/// **이 테이블의 주인은 lets-mentor 다.** 테이블 · 트리거 · 첨부 bucket 은 그쪽
+/// `supabase/migrations/20261027000000_mentor_applications.sql` 로 이미 만들어졌고, 여기 모델과
+/// prisma/migrations 의 같은 이름 폴더는 Prisma 가 이 테이블을 모르는 테이블로 보고 지우려 들지 않게 남긴 기록이다.
+/// 칸을 바꿀 일이 생기면 lets-mentor 의 SQL 부터 고친다.
+///
+/// 우리가 고치는 칸은 status · admin_memo 뿐이다. 나머지는 지원자가 낸 그대로 둔다.
+/// status · phone · 연차의 check 제약과 updated_at 트리거는 Prisma 가 표현하지 못해 SQL 에만 있다.
+model MentorApplication {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// DB 트리거도 고칠 때마다 now() 로 채운다.
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// received 접수 완료 · reviewing 검토중 · replied 회신완료 (domain/mentor-application-status.ts)
+  status String @default("received")
+
+  name              String
+  /// 숫자만(`01012345678`). 같은 번호로 다시 신청하지 못한다.
+  phone             String @unique
+  email             String
+  company           String
+  jobTitle          String @map("job_title")
+  yearsOfExperience Int    @map("years_of_experience")
+
+  jobFields      String[] @map("job_fields")
+  mentoringTypes String[] @map("mentoring_types")
+  introduction   String
+  motivation     String
+
+  /// private bucket `mentor-attachments` 안의 경로. 화면은 잠깐 열리는 signed URL 로만 연다.
+  attachmentPath String?  @map("attachment_path")
+  links          String[] @default([])
+
+  privacyAgreedAt DateTime @map("privacy_agreed_at") @db.Timestamptz(6)
+  /// 운영 메모. 지원자에게는 보이지 않는다.
+  adminMemo       String?  @map("admin_memo")
+
+  @@index([createdAt(sort: Desc)], map: "mentor_applications_created_at_idx")
+  @@map("mentor_applications")
+}
